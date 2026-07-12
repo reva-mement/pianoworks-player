@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PianoWorks Share Player</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #1b120a;
+    color: #f0e6d2;
+    font-family: 'Times New Roman', 'Hiragino Mincho ProN', serif;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .card {
+    width: min(520px, 90vw);
+    background: linear-gradient(160deg, #2a1c10, #1b120a);
+    border: 1px solid #b87333;
+    border-radius: 10px;
+    padding: 32px;
+    text-align: center;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+  }
+  h1 {
+    font-size: 14px;
+    letter-spacing: 4px;
+    color: #b87333;
+    margin: 0 0 8px;
+    font-weight: normal;
+  }
+  .title {
+    font-size: 22px;
+    margin: 0 0 28px;
+    word-break: break-word;
+  }
+  button#playBtn {
+    width: 84px; height: 84px;
+    border-radius: 50%;
+    border: 2px solid #d4af37;
+    background: radial-gradient(circle, #3a2612, #1b120a);
+    color: #d4af37;
+    font-size: 28px;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  button#playBtn:hover { box-shadow: 0 0 20px rgba(212,175,55,0.5); }
+  button#playBtn:active { transform: scale(0.95); }
+  .status {
+    margin-top: 20px;
+    font-size: 13px;
+    color: #cfc4ad;
+    min-height: 18px;
+  }
+  .bar-wrap {
+    margin-top: 16px;
+    height: 4px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, gold, #fff8dc);
+  }
+  .error {
+    color: #e0a0a0;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .footer {
+    margin-top: 28px;
+    font-size: 11px;
+    color: #6b5c48;
+    letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+  <div class="card" id="card">
+    <h1>PIANOWORKS SHARE</h1>
+    <div class="title" id="titleText">読み込み中…</div>
+    <div id="playArea"></div>
+    <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+    <div class="status" id="status"></div>
+    <div class="footer">Played with PianoWorks</div>
+  </div>
+
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const d = params.get('d');
+  const t = params.get('t');
+  const z = params.get('z'); // '1' = gzip圧縮あり
+
+  const titleEl = document.getElementById('titleText');
+  const playArea = document.getElementById('playArea');
+  const statusEl = document.getElementById('status');
+  const barEl = document.getElementById('bar');
+
+  titleEl.textContent = t ? decodeURIComponent(t) : 'Untitled Session';
+
+  if (!d) {
+    playArea.innerHTML = '<div class="error">再生データが見つかりません。<br>URLが正しいか確認してください。</div>';
+    return;
+  }
+
+  function base64UrlDecode(str) {
+    str = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (str.length % 4) str += '=';
+    const binary = atob(str);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  // ★ convertEventsToMidi() (アプリ本体 session.js) が生成する
+  //   固定フォーマット（TPQN=128, 120bpm, フォーマット0, 1トラック）専用の簡易パーサー
+  function parseSimpleMidi(bytes) {
+    const TPQN = 128;
+    const bpm = 120;
+    const msPerTick = (60000 / bpm) / TPQN;
+    let pos = 14; // MThdチャンク(8) + データ(6) = 14byte
+    pos += 8;     // MTrkチャンクの 'MTrk'(4) + length(4)
+    let tick = 0;
+    const events = [];
+
+    function readVLQ() {
+      let value = 0;
+      while (true) {
+        const b = bytes[pos++];
+        value = (value << 7) | (b & 0x7f);
+        if (!(b & 0x80)) break;
+      }
+      return value;
+    }
+
+    while (pos < bytes.length) {
+      const delta = readVLQ();
+      tick += delta;
+      const status = bytes[pos++];
+      if (status === 0xFF) {
+        const metaType = bytes[pos++];
+        const len = readVLQ();
+        pos += len;
+        if (metaType === 0x2F) break; // End of Track
+        continue;
+      }
+      const note = bytes[pos++];
+      const vel = bytes[pos++];
+      events.push({
+        note,
+        velocity: vel / 127,
+        time: (tick * msPerTick) / 1000,
+        type: (status & 0xF0) === 0x80 ? 'off' : 'on'
+      });
+    }
+    return events;
+  }
+
+  async function decodeToEvents() {
+    let bytes = base64UrlDecode(d);
+    if (z === '1') {
+      if (!window.DecompressionStream) {
+        throw new Error('このブラウザは展開(DecompressionStream)に対応していません');
+      }
+      const ds = new DecompressionStream('gzip');
+      const stream = new Blob([bytes]).stream().pipeThrough(ds);
+      bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+    return parseSimpleMidi(bytes);
+  }
+
+  // ★ 本編(core.js)と同じ音名変換ルール（MIDIノート番号 → "C4"のような音名）
+  const NOTE_NAMES = ['C', 'Cs', 'D', 'Ds', 'E', 'F', 'Fs', 'G', 'Gs', 'A', 'As', 'B'];
+  function midiToNoteName(m) {
+    return `${NOTE_NAMES[m % 12]}${Math.floor(m / 12) - 1}`;
+  }
+
+  // ★ 演奏に登場する音だけを本編と同じ場所（assets/sounds/*.mp3）から読み込む
+  const audioBufferCache = {};
+  async function preloadNeededSounds(ctx, events) {
+    const uniqueNotes = [...new Set(events.map(ev => ev.note))];
+    statusEl.textContent = `ピアノ音源を読み込み中…(0/${uniqueNotes.length})`;
+    let loaded = 0;
+    await Promise.allSettled(uniqueNotes.map(async (midiNote) => {
+      const name = midiToNoteName(midiNote);
+      try {
+        const res = await fetch(`assets/sounds/${name}.mp3`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = await res.arrayBuffer();
+        audioBufferCache[midiNote] = await ctx.decodeAudioData(buf);
+      } catch (e) {
+        console.warn(`音源読み込み失敗: ${name}.mp3`, e);
+      } finally {
+        loaded++;
+        statusEl.textContent = `ピアノ音源を読み込み中…(${loaded}/${uniqueNotes.length})`;
+      }
+    }));
+  }
+
+  function playEvents(ctx, events) {
+    const startTime = ctx.currentTime + 0.2;
+    const active = {};
+    const master = ctx.createGain();
+    master.gain.value = 0.9;
+    master.connect(ctx.destination);
+
+    let maxTime = 0;
+    events.forEach(ev => {
+      const when = startTime + ev.time;
+      maxTime = Math.max(maxTime, ev.time);
+      const buffer = audioBufferCache[ev.note];
+
+      if (ev.type === 'on') {
+        if (!buffer) return; // 読み込みに失敗した音はスキップ
+        const src = ctx.createBufferSource();
+        const gain = ctx.createGain();
+        src.buffer = buffer;
+        gain.gain.value = Math.min(1, Math.max(0.05, ev.velocity));
+        src.connect(gain).connect(master);
+        src.start(when);
+        active[ev.note] = { src, gain };
+      } else {
+        const a = active[ev.note];
+        if (a) {
+          // ★ 本編と同様、サンプルの自然な減衰を活かすためフェードのみ行いブツ切りにしない
+          a.gain.gain.setTargetAtTime(0, when, 0.15);
+          a.src.stop(when + 0.6);
+          delete active[ev.note];
+        }
+      }
+    });
+
+    // 再生中の進捗バー更新
+    const totalMs = (maxTime + 1) * 1000;
+    const t0 = performance.now();
+    function tick() {
+      const elapsed = performance.now() - t0;
+      const pct = Math.min(100, (elapsed / totalMs) * 100);
+      barEl.style.width = pct + '%';
+      if (pct < 100) {
+        requestAnimationFrame(tick);
+      } else {
+        statusEl.textContent = '再生終了';
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  const btn = document.createElement('button');
+  btn.id = 'playBtn';
+  btn.textContent = '▶';
+  playArea.appendChild(btn);
+
+  let started = false;
+  btn.addEventListener('click', async () => {
+    if (started) return;
+    started = true;
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    statusEl.textContent = '読み込み中…';
+    try {
+      const events = await decodeToEvents();
+      if (events.length === 0) {
+        statusEl.textContent = '演奏データが空でした';
+        return;
+      }
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      await preloadNeededSounds(ctx, events);
+      statusEl.textContent = '再生中…';
+      playEvents(ctx, events);
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = '';
+      playArea.innerHTML = '<div class="error">再生に失敗しました。<br>' + (err.message || '') + '</div>';
+    }
+  });
+})();
+</script>
+</body>
+</html>
